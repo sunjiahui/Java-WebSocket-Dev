@@ -303,6 +303,6 @@ public class PerMessageDeflateExtensionTest {
     assertFalse(deflateExtension.isClientNoContextTakeover());
     assertTrue(deflateExtension.isServerNoContextTakeover());
     assertEquals(1024, deflateExtension.getThreshold());
-    assertEquals(Deflater.DEFAULT_COMPRESSION, deflateExtension.getCompressionLevel());
+    assertEquals(Deflater.BEST_SPEED, deflateExtension.getCompressionLevel());
   }
 }

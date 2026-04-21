@@ -4,6 +4,7 @@ import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
 import java.util.zip.Inflater;
@@ -56,13 +57,16 @@ public class PerMessageDeflateExtension extends CompressionExtension {
   private final Inflater inflater;
   private final Deflater deflater;
 
+  // Object pool for Deflaters used in no_context_takeover mode
+  private final ConcurrentLinkedQueue<Deflater> deflaterPool = new ConcurrentLinkedQueue<>();
+
   /**
    * Constructor for the PerMessage Deflate Extension (<a href="https://tools.ietf.org/html/rfc7692#section-7">7&#46; Thepermessage-deflate" Extension</a>)
    *
-   * Uses {@link java.util.zip.Deflater#DEFAULT_COMPRESSION} as the compression level for the {@link java.util.zip.Deflater#Deflater(int)}
+   * Uses {@link java.util.zip.Deflater#BEST_SPEED} as the compression level for the {@link java.util.zip.Deflater#Deflater(int)}
    */
   public PerMessageDeflateExtension() {
-    this(Deflater.DEFAULT_COMPRESSION);
+    this(Deflater.BEST_SPEED);
   }
 
   /**
@@ -216,28 +220,63 @@ public class PerMessageDeflateExtension extends CompressionExtension {
 
   @Override
   public void encodeFrame(Framedata inputFrame) {
-    // Only DataFrames can be decompressed.
+    if (serverNoContextTakeover) {
+      encodeFrameWithPool(inputFrame);
+    } else {
+      synchronized (deflater) {
+        encodeFrameShared(inputFrame, deflater, false);
+      }
+    }
+  }
+
+  /**
+   * Encode using a pooled Deflater (no_context_takeover mode). Thread-safe without locking.
+   */
+  private void encodeFrameWithPool(Framedata inputFrame) {
     if (!(inputFrame instanceof DataFrame)) {
       return;
     }
-
     byte[] payloadData = inputFrame.getPayloadData().array();
     if (payloadData.length < threshold) {
       return;
     }
+
+    Deflater pooledDeflater = borrowDeflater();
+    try {
+      encodeFrameShared(inputFrame, pooledDeflater, true);
+    } finally {
+      pooledDeflater.reset();
+      deflaterPool.offer(pooledDeflater);
+    }
+  }
+
+  /**
+   * Core compression logic shared by both pool and synchronized paths.
+   */
+  private void encodeFrameShared(Framedata inputFrame, Deflater d, boolean skipChecks) {
+    if (!skipChecks) {
+      if (!(inputFrame instanceof DataFrame)) {
+        return;
+      }
+      byte[] payloadData = inputFrame.getPayloadData().array();
+      if (payloadData.length < threshold) {
+        return;
+      }
+    }
+
     // Only the first frame's RSV1 must be set.
     if (!(inputFrame instanceof ContinuousFrame)) {
       ((DataFrame) inputFrame).setRSV1(true);
     }
 
-    deflater.setInput(payloadData);
+    byte[] payloadData = inputFrame.getPayloadData().array();
+    d.setInput(payloadData);
     // Compressed output buffer.
     ByteArrayOutputStream output = new ByteArrayOutputStream();
     // Temporary buffer to hold compressed output.
-    byte[] buffer = new byte[1024];
+    byte[] buffer = new byte[BUFFER_SIZE];
     int bytesCompressed;
-    while ((bytesCompressed = deflater.deflate(buffer, 0, buffer.length, Deflater.SYNC_FLUSH))
-        > 0) {
+    while ((bytesCompressed = d.deflate(buffer, 0, buffer.length, Deflater.SYNC_FLUSH)) > 0) {
       output.write(buffer, 0, bytesCompressed);
     }
 
@@ -254,14 +293,18 @@ public class PerMessageDeflateExtension extends CompressionExtension {
       if (endsWithTail(outputBytes)) {
         outputLength -= TAIL_BYTES.length;
       }
-
-      if (serverNoContextTakeover) {
-        deflater.reset();
-      }
     }
 
     // Set frames payload to the new compressed data.
     ((FramedataImpl1) inputFrame).setPayload(ByteBuffer.wrap(outputBytes, 0, outputLength));
+  }
+
+  private Deflater borrowDeflater() {
+    Deflater d = deflaterPool.poll();
+    if (d == null) {
+      d = new Deflater(compressionLevel, true);
+    }
+    return d;
   }
 
   /**
